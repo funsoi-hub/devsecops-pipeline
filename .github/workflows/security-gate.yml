@@ -60,9 +60,9 @@ on:
         type: boolean
         default: true
       pipeline-ref:
-        description: Ref of this repository to load helper scripts from (keep in step with the @ref you call)
+        description: Commit SHA of this repository to load helper scripts from (use the same SHA as the @ref you call)
         type: string
-        default: v1
+        default: main
     outputs:
       high-findings:
         description: Total high/critical findings across all scanners
@@ -122,9 +122,10 @@ jobs:
         id: count
         run: |
           echo "### Static analysis (SAST)" >> "$GITHUB_STEP_SUMMARY"
-          s=$(python3 .devsecops/scripts/count_findings.py semgrep semgrep.json "$GITHUB_STEP_SUMMARY" | tail -1)
-          b=$(python3 .devsecops/scripts/count_findings.py bandit bandit.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          s=$(python3 .devsecops/scripts/count_findings.py semgrep semgrep.json "$GITHUB_STEP_SUMMARY" ann.txt | tail -1)
+          b=$(python3 .devsecops/scripts/count_findings.py bandit bandit.json "$GITHUB_STEP_SUMMARY" ann.txt | tail -1)
           echo "count=$((s + b))" >> "$GITHUB_OUTPUT"
+          cat ann.txt 2>/dev/null || true
       - name: Upload SARIF to the Security tab
         if: always() && hashFiles('semgrep.sarif') != ''
         continue-on-error: true # forks don't get security-events: write
@@ -175,8 +176,9 @@ jobs:
         id: count
         run: |
           echo "### Secrets" >> "$GITHUB_STEP_SUMMARY"
-          n=$(python3 .devsecops/scripts/count_findings.py gitleaks gitleaks.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          n=$(python3 .devsecops/scripts/count_findings.py gitleaks gitleaks.json "$GITHUB_STEP_SUMMARY" ann.txt | tail -1)
           echo "count=$n" >> "$GITHUB_OUTPUT"
+          cat ann.txt 2>/dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -242,10 +244,11 @@ jobs:
           for r in trivy-deps trivy-config trivy-image; do
             [ -f "$r.json" ] || continue
             echo "<sub>$r</sub>" >> "$GITHUB_STEP_SUMMARY"
-            n=$(python3 .devsecops/scripts/count_findings.py trivy "$r.json" "$GITHUB_STEP_SUMMARY" | tail -1)
+            n=$(python3 .devsecops/scripts/count_findings.py trivy "$r.json" "$GITHUB_STEP_SUMMARY" ann.txt | tail -1)
             total=$((total + n))
           done
           echo "count=$total" >> "$GITHUB_OUTPUT"
+          cat ann.txt 2>/dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -303,8 +306,9 @@ jobs:
         id: count
         run: |
           echo "### Dynamic analysis (DAST)" >> "$GITHUB_STEP_SUMMARY"
-          n=$(python3 .devsecops/scripts/count_findings.py zap zap/zap.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          n=$(python3 .devsecops/scripts/count_findings.py zap zap/zap.json "$GITHUB_STEP_SUMMARY" ann.txt | tail -1)
           echo "count=$n" >> "$GITHUB_OUTPUT"
+          cat ann.txt 2>/dev/null || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

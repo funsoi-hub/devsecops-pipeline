@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Count high-severity findings in a scanner report and print a Markdown table.
 
-Usage: count_findings.py <tool> <report.json> [summary.md]
-Prints the count on stdout's last line; appends a findings table to summary.md.
+Usage: count_findings.py <tool> <report.json> [summary.md] [annotations.txt]
+Prints the count on stdout's last line, appends a findings table to summary.md, and
+writes GitHub annotation commands to annotations.txt (the caller `cat`s it), so each
+finding shows on the run and pull-request pages without downloading artifacts.
 Kept dependency-free so it runs on any runner.
 """
 
@@ -52,6 +54,7 @@ PARSERS = {"semgrep": semgrep, "bandit": bandit, "gitleaks": gitleaks, "trivy": 
 def main() -> None:
     tool, report = sys.argv[1], Path(sys.argv[2])
     summary = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    annotations = Path(sys.argv[4]) if len(sys.argv) > 4 else None
     data = json.loads(report.read_text()) if report.exists() and report.stat().st_size else {}
     rows = list(PARSERS[tool](data))
     if summary:
@@ -64,6 +67,11 @@ def main() -> None:
                     f.write(f"| {clean(rule)} | `{clean(loc)}` | {clean(detail)} |\n")
                 if len(rows) > 50:
                     f.write(f"\n_...and {len(rows) - 50} more. Download the report artifact for all of them._\n")
+    if annotations:
+        with annotations.open("a") as f:
+            for rule, loc, detail in rows[:20]:
+                esc = lambda s: str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")  # noqa: E731
+                f.write(f"::warning title={esc(tool)} {esc(rule)}::{esc(loc)} {esc(detail)}\n")
     print(len(rows))
 
 

@@ -32,7 +32,7 @@ flowchart LR
 | Dockerfile (IaC) | Trivy `config` | Running as root, unpinned base images, secrets in layers | `HIGH`/`CRITICAL` |
 | DAST | OWASP ZAP baseline | Missing headers, cookie flags, information leaks in the **running** app | ZAP risk `High` |
 
-Results show in the job summary as a table of findings. Semgrep findings also go to the repo's **Security → Code scanning** tab, and full reports are kept as downloadable artifacts.
+Each finding appears as an annotation on the run and pull request, and the job summary lists them in a table. Semgrep findings also go to the repo's **Security → Code scanning** tab, and full reports are kept as downloadable artifacts.
 
 ## Use it in your repo
 
@@ -57,7 +57,7 @@ jobs:
       run-dast: true
       app-port: 8000
       healthcheck-path: /healthz
-      pipeline-ref: <commit-sha>
+      pipeline-ref: <same-commit-sha>
 ```
 
 Then **block merging when it fails**: in the repo, go to Settings → Rules → Rulesets → New branch ruleset. Target `main`, turn on **Require status checks to pass**, and add `security / gate`.
@@ -71,6 +71,7 @@ Then **block merging when it fails**: in the repo, go to Settings → Rules → 
 | `app-port` / `healthcheck-path` / `dast-path` | `8000` / `/` / `/` | How to reach the app during DAST |
 | `container-env` | _(empty)_ | `KEY=VALUE` lines for the DAST container (no real secrets) |
 | `enforce` | `true` | `false` reports findings without failing |
+| `pipeline-ref` | `main` | Ref to load helper scripts from; set it to the same commit SHA as the `uses:` line |
 
 Output: `high-findings`, the total count across all stages.
 
