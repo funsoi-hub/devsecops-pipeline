@@ -1,0 +1,364 @@
+# Reusable DevSecOps security gate.
+#
+# Call it from any repository:
+#
+#   jobs:
+#     security:
+#       uses: funsoi-hub/devsecops-pipeline/.github/workflows/security-gate.yml@v1
+#       permissions: { contents: read, security-events: write }
+#       with:
+#         source-dir: app
+#         dockerfile: Dockerfile
+#
+# Make the "gate" check required in a branch ruleset and nothing with a
+# high-severity finding can be merged into main.
+#
+# Hardening choices, on purpose:
+#   * Every action is pinned to a full commit SHA, not a tag (tags can be rewritten,
+#     as in the March 2026 trivy-action compromise).
+#   * Scanner binaries are downloaded from GitHub releases and checked against a
+#     SHA-256 checksum pinned in this file before they run.
+#   * The token is read-only, and checkout doesn't persist credentials.
+
+name: security-gate
+
+on:
+  workflow_call:
+    inputs:
+      source-dir:
+        description: Folder with the code to scan for code vulnerabilities (SAST)
+        type: string
+        default: "."
+      project-dir:
+        description: Folder with requirements files and the Docker build context
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path relative to project-dir. Leave empty to skip container scanning and DAST.
+        type: string
+        default: ""
+      run-dast:
+        description: Start the container and run an OWASP ZAP baseline scan against it
+        type: boolean
+        default: false
+      app-port:
+        type: number
+        default: 8000
+      container-env:
+        description: KEY=VALUE lines passed to the container during DAST (no secrets)
+        type: string
+        default: ""
+      healthcheck-path:
+        type: string
+        default: "/"
+      dast-path:
+        description: Path ZAP starts crawling from
+        type: string
+        default: "/"
+      enforce:
+        description: Fail the build when high-severity findings exist
+        type: boolean
+        default: true
+      pipeline-ref:
+        description: Ref of this repository to load helper scripts from (keep in step with the @ref you call)
+        type: string
+        default: v1
+    outputs:
+      high-findings:
+        description: Total high/critical findings across all scanners
+        value: ${{ jobs.gate.outputs.total }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  SEMGREP_VERSION: "1.186.0"
+  BANDIT_VERSION: "1.9.4"
+  TRIVY_VERSION: "0.76.2"
+  TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.1
+
+jobs:
+  # ---------------------------------------------------------------- SAST
+  sast:
+    name: SAST (Semgrep + Bandit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      count: ${{ steps.count.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: funsoi-hub/devsecops-pipeline
+          ref: ${{ inputs.pipeline-ref }}
+          path: .devsecops
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install scanners
+        run: pip install "semgrep==${SEMGREP_VERSION}" "bandit==${BANDIT_VERSION}"
+      - name: Semgrep (OWASP Top 10 + Python rules, ERROR severity)
+        env:
+          SRC: ${{ inputs.source-dir }}
+        run: |
+          semgrep scan --config p/python --config p/owasp-top-ten --severity ERROR --metrics=off \
+            --exclude .devsecops --json-output=semgrep.json --sarif-output=semgrep.sarif "$SRC" || true
+      - name: Bandit (high severity, medium+ confidence)
+        env:
+          SRC: ${{ inputs.source-dir }}
+        run: |
+          bandit -r "$SRC" -x ./.devsecops,./tests,./test --severity-level high --confidence-level medium \
+            -f json -o bandit.json || true
+      - name: Count findings
+        id: count
+        run: |
+          echo "### Static analysis (SAST)" >> "$GITHUB_STEP_SUMMARY"
+          s=$(python3 .devsecops/scripts/count_findings.py semgrep semgrep.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          b=$(python3 .devsecops/scripts/count_findings.py bandit bandit.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          echo "count=$((s + b))" >> "$GITHUB_OUTPUT"
+      - name: Upload SARIF to the Security tab
+        if: always() && hashFiles('semgrep.sarif') != ''
+        continue-on-error: true # forks don't get security-events: write
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sast-reports
+          path: |
+            semgrep.json
+            bandit.json
+          if-no-files-found: ignore
+      - name: Enforce
+        if: inputs.enforce && steps.count.outputs.count != '0'
+        env:
+          COUNT: ${{ steps.count.outputs.count }}
+        run: echo "::error::$COUNT high-severity code finding(s)" && exit 1
+
+  # ---------------------------------------------------------------- secrets
+  secrets:
+    name: Secret scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.count.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # scan the whole history: a deleted secret is still a leaked secret
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: funsoi-hub/devsecops-pipeline
+          ref: ${{ inputs.pipeline-ref }}
+          path: .devsecops
+          persist-credentials: false
+      - name: Install Gitleaks (checksum verified)
+        run: |
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${f}"
+          echo "${GITLEAKS_SHA256}  ${f}" | sha256sum --check --strict
+          tar -xzf "$f" gitleaks && sudo install gitleaks /usr/local/bin/
+      - name: Scan git history
+        run: gitleaks git --redact --no-banner --report-format json --report-path gitleaks.json --exit-code 0 .
+      - name: Count findings
+        id: count
+        run: |
+          echo "### Secrets" >> "$GITHUB_STEP_SUMMARY"
+          n=$(python3 .devsecops/scripts/count_findings.py gitleaks gitleaks.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: secrets-report
+          path: gitleaks.json # values are redacted
+          if-no-files-found: ignore
+      - name: Enforce
+        if: inputs.enforce && steps.count.outputs.count != '0'
+        env:
+          COUNT: ${{ steps.count.outputs.count }}
+        run: echo "::error::$COUNT secret(s) found in git history" && exit 1
+
+  # ---------------------------------------------------------------- SCA + container + IaC
+  supply-chain:
+    name: Dependencies, container & Dockerfile (Trivy)
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.count.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: funsoi-hub/devsecops-pipeline
+          ref: ${{ inputs.pipeline-ref }}
+          path: .devsecops
+          persist-credentials: false
+      - name: Install Trivy (checksum verified)
+        run: |
+          f="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLO "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${f}"
+          echo "${TRIVY_SHA256}  ${f}" | sha256sum --check --strict
+          tar -xzf "$f" trivy && sudo install trivy /usr/local/bin/
+      - name: Dependency vulnerabilities (SCA)
+        env:
+          PROJECT: ${{ inputs.project-dir }}
+        run: |
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --skip-dirs .devsecops \
+            --format json --output trivy-deps.json --exit-code 0 "$PROJECT"
+      - name: Dockerfile misconfigurations (IaC)
+        if: inputs.dockerfile != ''
+        env:
+          PROJECT: ${{ inputs.project-dir }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          trivy config --severity HIGH,CRITICAL --format json --output trivy-config.json --exit-code 0 \
+            "$PROJECT/$DOCKERFILE"
+      - name: Build and scan container image
+        if: inputs.dockerfile != ''
+        env:
+          PROJECT: ${{ inputs.project-dir }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          docker build -t security-gate/app:scan -f "$PROJECT/$DOCKERFILE" "$PROJECT"
+          trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --format json --output trivy-image.json --exit-code 0 security-gate/app:scan
+      - name: Count findings
+        id: count
+        run: |
+          echo "### Supply chain" >> "$GITHUB_STEP_SUMMARY"
+          total=0
+          for r in trivy-deps trivy-config trivy-image; do
+            [ -f "$r.json" ] || continue
+            echo "<sub>$r</sub>" >> "$GITHUB_STEP_SUMMARY"
+            n=$(python3 .devsecops/scripts/count_findings.py trivy "$r.json" "$GITHUB_STEP_SUMMARY" | tail -1)
+            total=$((total + n))
+          done
+          echo "count=$total" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: supply-chain-reports
+          path: trivy-*.json
+          if-no-files-found: ignore
+      - name: Enforce
+        if: inputs.enforce && steps.count.outputs.count != '0'
+        env:
+          COUNT: ${{ steps.count.outputs.count }}
+        run: echo "::error::$COUNT high/critical dependency, image or Dockerfile finding(s)" && exit 1
+
+  # ---------------------------------------------------------------- DAST
+  dast:
+    name: DAST (OWASP ZAP baseline)
+    if: inputs.run-dast && inputs.dockerfile != ''
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.count.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: funsoi-hub/devsecops-pipeline
+          ref: ${{ inputs.pipeline-ref }}
+          path: .devsecops
+          persist-credentials: false
+      - name: Start the application
+        env:
+          PROJECT: ${{ inputs.project-dir }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PORT: ${{ inputs.app-port }}
+          CONTAINER_ENV: ${{ inputs.container-env }}
+          HEALTH: ${{ inputs.healthcheck-path }}
+        run: |
+          docker build -t security-gate/app:dast -f "$PROJECT/$DOCKERFILE" "$PROJECT"
+          printf '%s\n' "$CONTAINER_ENV" > app.env
+          docker run -d --name app --env-file app.env -p "${PORT}:${PORT}" security-gate/app:dast
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${PORT}${HEALTH}" > /dev/null && echo "App is up" && exit 0
+            sleep 2
+          done
+          echo "::error::App did not become healthy" && docker logs app && exit 1
+      - name: ZAP baseline scan
+        env:
+          PORT: ${{ inputs.app-port }}
+          DAST_PATH: ${{ inputs.dast-path }}
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" "$ZAP_IMAGE" \
+            zap-baseline.py -t "http://localhost:${PORT}${DAST_PATH}" -m 3 -I -J zap.json -r zap.html || true
+      - name: Count findings
+        id: count
+        run: |
+          echo "### Dynamic analysis (DAST)" >> "$GITHUB_STEP_SUMMARY"
+          n=$(python3 .devsecops/scripts/count_findings.py zap zap/zap.json "$GITHUB_STEP_SUMMARY" | tail -1)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: dast-report
+          path: zap/
+          if-no-files-found: ignore
+      - name: Enforce
+        if: inputs.enforce && steps.count.outputs.count != '0'
+        env:
+          COUNT: ${{ steps.count.outputs.count }}
+        run: echo "::error::$COUNT high-risk DAST alert(s)" && exit 1
+
+  # ---------------------------------------------------------------- gate
+  gate:
+    name: gate
+    needs: [sast, secrets, supply-chain, dast]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      total: ${{ steps.verdict.outputs.total }}
+    steps:
+      - name: Verdict
+        id: verdict
+        env:
+          ENFORCE: ${{ inputs.enforce }}
+          SAST: ${{ needs.sast.outputs.count || 0 }}
+          SECRETS: ${{ needs.secrets.outputs.count || 0 }}
+          SUPPLY: ${{ needs.supply-chain.outputs.count || 0 }}
+          DAST: ${{ needs.dast.outputs.count || 0 }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          total=$((SAST + SECRETS + SUPPLY + DAST))
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Security gate"
+            echo "| Check | High-severity findings |"
+            echo "|---|---|"
+            echo "| SAST (Semgrep, Bandit) | $SAST |"
+            echo "| Secrets (Gitleaks) | $SECRETS |"
+            echo "| Dependencies, image, Dockerfile (Trivy) | $SUPPLY |"
+            echo "| DAST (ZAP) | $DAST |"
+            echo "| **Total** | **$total** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ENFORCE" != "true" ]; then
+            echo "Report-only mode: $total finding(s), not blocking." >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          if echo "$RESULTS" | grep -qE "cancelled"; then
+            echo "::error::A security job was cancelled" && exit 1
+          fi
+          if [ "$total" -gt 0 ]; then
+            echo "**Blocked:** fix the findings above before merging." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Security gate failed with $total high-severity finding(s)" && exit 1
+          fi
+          if echo "$RESULTS" | grep -qE "failure"; then
+            echo "::error::A security job failed to run" && exit 1
+          fi
+          echo "**Passed:** no high-severity findings." >> "$GITHUB_STEP_SUMMARY"

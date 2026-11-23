@@ -1,0 +1,5 @@
+# [Trivy] old versions with known high/critical CVEs, on purpose
+flask==0.12.2
+PyYAML==5.3
+requests==2.19.1
+Jinja2==2.10

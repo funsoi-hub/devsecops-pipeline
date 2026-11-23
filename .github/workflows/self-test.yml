@@ -1,0 +1,38 @@
+# Proves the gate works: scan an app full of planted flaws and FAIL if nothing is found.
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-vulnerable-example:
+    uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      source-dir: examples/vulnerable-app
+      project-dir: examples/vulnerable-app
+      dockerfile: Dockerfile
+      enforce: false # report-only: we expect findings here
+      pipeline-ref: ${{ github.sha }}
+
+  assert-gate-catches-issues:
+    needs: scan-vulnerable-example
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate must detect the planted vulnerabilities
+        env:
+          FOUND: ${{ needs.scan-vulnerable-example.outputs.high-findings }}
+        run: |
+          echo "Gate found ${FOUND:-0} high-severity finding(s) in the vulnerable example."
+          if [ "${FOUND:-0}" -lt 5 ]; then
+            echo "::error::Expected the gate to catch the planted flaws. Is a scanner broken?"
+            exit 1
+          fi
