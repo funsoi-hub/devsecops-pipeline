@@ -1,43 +1,74 @@
-# DevSecOps Pipeline: a reusable CI security gate
+# DevSecOps Pipeline
 
 [![self-test](https://github.com/funsoi-hub/devsecops-pipeline/actions/workflows/self-test.yml/badge.svg)](https://github.com/funsoi-hub/devsecops-pipeline/actions/workflows/self-test.yml)
 [![lint-workflows](https://github.com/funsoi-hub/devsecops-pipeline/actions/workflows/lint-workflows.yml/badge.svg)](https://github.com/funsoi-hub/devsecops-pipeline/actions/workflows/lint-workflows.yml)
 
-A reusable GitHub Actions workflow that runs five kinds of security testing on every pull request and **fails the build on any high-severity finding**. Make its check required, and risky code can't reach `main`.
+A security gate for GitHub that checks every pull request for vulnerabilities and **refuses to let risky code reach the main branch.** Any repository can plug it in with about 10 lines of configuration.
 
-It protects [Secure Vault](https://github.com/funsoi-hub/secure-vault), and any repo can use it with about 10 lines of YAML.
+It currently protects my [Secure Vault](https://github.com/funsoi-hub/secure-vault) app.
+
+## Why I built this
+
+Running security scans by hand is something I do a lot, and the problem is always the same: by the time a report is written, the vulnerable code is already live. I wanted the checks to happen **automatically, before the code is merged**, so a problem gets fixed while it's still cheap to fix.
+
+I also wanted it to be reusable. Instead of copy-pasting scanner setup into every project, I fix a rule once here and every repo that uses the gate gets the improvement.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    PR["Pull request"] --> SAST["SAST<br/>Semgrep + Bandit"]
-    PR --> SEC["Secrets<br/>Gitleaks (full history)"]
-    PR --> SCA["Supply chain<br/>Trivy: deps, image, Dockerfile"]
-    PR --> DAST["DAST<br/>OWASP ZAP vs running container"]
-    SAST --> G{"gate"}
+    PR["Pull request"] --> SAST["Code scan<br/>Semgrep + Bandit"]
+    PR --> SEC["Secret scan<br/>Gitleaks"]
+    PR --> SCA["Dependency + container scan<br/>Trivy"]
+    PR --> DAST["Live attack scan<br/>OWASP ZAP"]
+    SAST --> G{"Gate"}
     SEC --> G
     SCA --> G
     DAST --> G
-    G -->|"0 high findings"| M["Merge allowed"]
-    G -->|"any high finding"| B["Merge blocked"]
+    G -->|"no serious findings"| M["Merge allowed"]
+    G -->|"any high-severity finding"| B["Merge blocked"]
 ```
 
-## What each stage catches
+All four scans run side by side. A final "gate" step adds up the results and fails the build if anything serious turned up.
 
-| Stage | Tool | Catches | Fails on |
+## What each scan looks for
+
+| Scan | Tool | What it catches | Blocks on |
 |---|---|---|---|
-| SAST | Semgrep (`p/python`, `p/owasp-top-ten`) + Bandit | Injection, unsafe deserialisation, shell commands, weak crypto, debug mode | Semgrep `ERROR`, Bandit `HIGH` (medium+ confidence) |
-| Secrets | Gitleaks | API keys, tokens and passwords, **including ones deleted in later commits** | Any finding |
-| Dependencies (SCA) | Trivy `fs` | Known CVEs in `requirements.txt`, lock files and so on | `HIGH`/`CRITICAL` with a fix available |
-| Container image | Trivy `image` | CVEs in the OS packages and libraries of the built image | `HIGH`/`CRITICAL` with a fix available |
-| Dockerfile (IaC) | Trivy `config` | Running as root, unpinned base images, secrets in layers | `HIGH`/`CRITICAL` |
-| DAST | OWASP ZAP baseline | Missing headers, cookie flags, information leaks in the **running** app | ZAP risk `High` |
+| **Code (SAST)** | Semgrep + Bandit | SQL injection, command injection, unsafe deserialisation, weak crypto, debug mode left on | High severity |
+| **Secrets** | Gitleaks | API keys, tokens and passwords committed to git, **even ones deleted in later commits** | Any secret |
+| **Dependencies** | Trivy | Known vulnerabilities (CVEs) in the libraries a project uses | High or critical, where a fix exists |
+| **Container image** | Trivy | Known vulnerabilities in the Docker image's operating system and packages | High or critical, where a fix exists |
+| **Dockerfile** | Trivy | Risky container setup, like running as root | High or critical |
+| **Running app (DAST)** | OWASP ZAP | Missing security headers, insecure cookies, information leaks, found by poking the live app | High risk |
 
-Each finding appears as an annotation on the run and pull request, and the job summary lists them in a table. Semgrep findings also go to the repo's **Security → Code scanning** tab, and full reports are kept as downloadable artifacts.
+Every finding shows up as a note on the pull request, and the run summary lists them in a table, so nobody has to dig through log files.
 
-## Use it in your repo
+## Proof that it actually works
+
+A gate that always passes proves nothing, so I built a test for the gate itself.
+
+[`examples/vulnerable-app`](examples/vulnerable-app) is a tiny web app I wrote **deliberately full of holes**, one for each scanner: SQL injection, command injection, unsafe YAML parsing, debug mode, a committed API key, outdated libraries, an end-of-life base image and a container running as root.
+
+On every change, the [self-test](.github/workflows/self-test.yml) runs the gate against that app and **fails if the gate doesn't catch the problems.** If a scanner ever silently breaks, I find out straight away.
+
+It's already proved itself on a real project: on its first run against Secure Vault, it blocked the build over 5 high-severity vulnerabilities hidden in the Docker base image.
+
+## Securing the pipeline itself
+
+A security pipeline is an attractive target: it runs on every commit and often has access to secrets. In March 2026 attackers [hijacked the popular trivy-action](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23), and anyone who referenced it by version tag ran their credential-stealing code. With that in mind, I:
+
+- **Pin every GitHub Action to an exact commit**, not a version tag that can be quietly moved.
+- **Don't use third-party scanner actions at all.** I download Trivy and Gitleaks myself and check each download against a known fingerprint (SHA-256 checksum) before running it.
+- **Give the pipeline read-only access**, and don't leave login credentials on the runner.
+- **Never paste untrusted values straight into shell commands**, which prevents a class of attack called template injection.
+- **Scan my own workflow files** with [zizmor](https://docs.zizmor.sh), a security linter for GitHub Actions, on every change.
+
+## Use it in your own repo
+
+Add this file to your repository as `.github/workflows/security.yml`:
 
 ```yaml
-# .github/workflows/security.yml
 name: security
 on:
   pull_request:
@@ -47,53 +78,51 @@ permissions:
   contents: read
 jobs:
   security:
-    uses: funsoi-hub/devsecops-pipeline/.github/workflows/security-gate.yml@<commit-sha>  # v1
+    uses: funsoi-hub/devsecops-pipeline/.github/workflows/security-gate.yml@<commit-sha>
     permissions:
       contents: read
       security-events: write
     with:
-      source-dir: app          # code to scan
-      dockerfile: Dockerfile   # omit to skip image scan + DAST
+      source-dir: app          # where your code lives
+      dockerfile: Dockerfile   # leave out to skip the container and live scans
       run-dast: true
       app-port: 8000
       healthcheck-path: /healthz
       pipeline-ref: <same-commit-sha>
 ```
 
-Then **block merging when it fails**: in the repo, go to Settings → Rules → Rulesets → New branch ruleset. Target `main`, turn on **Require status checks to pass**, and add `security / gate`.
+Then make it mandatory. In your repo, go to **Settings → Rules → Rulesets → New branch ruleset**, target `main`, turn on **Require status checks to pass**, and add `security / gate`.
 
-| Input | Default | Purpose |
+<details>
+<summary>All options</summary>
+
+| Option | Default | What it's for |
 |---|---|---|
-| `source-dir` | `.` | Code to scan with SAST |
-| `project-dir` | `.` | Folder with requirements files and the Docker build context |
-| `dockerfile` | _(empty)_ | Dockerfile path relative to `project-dir`; empty skips image scan and DAST |
-| `run-dast` | `false` | Start the container and scan it with ZAP |
-| `app-port` / `healthcheck-path` / `dast-path` | `8000` / `/` / `/` | How to reach the app during DAST |
-| `container-env` | _(empty)_ | `KEY=VALUE` lines for the DAST container (no real secrets) |
-| `enforce` | `true` | `false` reports findings without failing |
-| `pipeline-ref` | `main` | Ref to load helper scripts from; set it to the same commit SHA as the `uses:` line |
+| `source-dir` | `.` | The code to scan |
+| `project-dir` | `.` | Folder with your requirements files and Docker build |
+| `dockerfile` | _(empty)_ | Path to your Dockerfile; leave empty to skip the container and live scans |
+| `run-dast` | `false` | Start your app and attack it with OWASP ZAP |
+| `app-port` / `healthcheck-path` / `dast-path` | `8000` / `/` / `/` | How to reach your app during the live scan |
+| `container-env` | _(empty)_ | `KEY=VALUE` settings for the app during the scan (no real secrets) |
+| `enforce` | `true` | Set to `false` to report findings without blocking |
+| `pipeline-ref` | `main` | Set to the same commit as the `uses:` line |
 
-Output: `high-findings`, the total count across all stages.
+The gate also outputs `high-findings`, the total number of serious findings.
 
-## Proof that it works
+</details>
 
-A gate that always passes proves nothing. [`examples/vulnerable-app`](examples/vulnerable-app) is a small Flask app with one planted flaw for each scanner (SQL injection, `shell=True`, unsafe YAML, debug mode, a committed API key, old dependencies, an end-of-life base image, root container).
+## Decisions I made, and why
 
-The [self-test workflow](.github/workflows/self-test.yml) runs the gate against it on every change, and **fails if the gate doesn't catch them**. If a scanner silently breaks, I find out straight away.
+- **Only block on serious, fixable issues.** If a gate blocks on every minor warning, people learn to ignore it. Vulnerabilities with no fix yet are reported but don't block, because nobody can act on them.
+- **Scan the whole git history for secrets.** Deleting a leaked key in a later commit doesn't un-leak it. It has to be revoked and replaced.
+- **Run each scanner separately.** If one breaks, the others still report, and one problem never hides another.
 
-## Hardening the pipeline itself
+## What I learned
 
-A security pipeline is a juicy target: it runs on every commit and often has access to secrets. In March 2026, attackers [rewrote 76 version tags of `aquasecurity/trivy-action`](https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23) to steal CI secrets, and anyone who pinned to a tag ran their malware. So this pipeline:
+- **Tools are the easy part; tuning them is the job.** Picking severity thresholds that catch real problems without drowning people in noise took more thought than wiring up the scanners.
+- **Your CI pipeline is part of your attack surface.** The trivy-action incident changed how I think about "trusted" tools.
+- **Test your security controls, not just your code.** The deliberately vulnerable app is what gives me confidence the gate works.
 
-- **Pins every action to a full commit SHA**, never a tag. Dependabot keeps the SHAs up to date.
-- **Doesn't use third-party scanner actions at all.** It downloads Trivy and Gitleaks release binaries and **verifies a pinned SHA-256 checksum** before running them.
-- **Runs with a read-only token** and `persist-credentials: false`. Only SARIF upload gets `security-events: write`.
-- **Passes untrusted values through environment variables**, never `${{ }}` inside shell scripts, to prevent template injection.
-- **Lints its own workflows with [zizmor](https://docs.zizmor.sh)** on every change ([lint-workflows](.github/workflows/lint-workflows.yml)).
+---
 
-## Design decisions
-
-- **Fail only on HIGH/CRITICAL with a fix available.** Blocking on every low finding trains people to ignore the gate. Unfixable CVEs can't be acted on, so they're reported, not blocking.
-- **One reusable workflow, not copy-pasted YAML.** Fix a rule once, and every repo that calls the gate gets it.
-- **Scan the whole git history for secrets.** Deleting a key in a later commit doesn't un-leak it; it has to be rotated.
-- **Each scanner runs as its own job**, in parallel. The gate job collects the results, so one failure never hides another.
+Built by **Funso Isola** · [LinkedIn](https://linkedin.com/in/funisola) · [More projects](https://github.com/funsoi-hub)
